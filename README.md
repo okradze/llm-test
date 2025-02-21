@@ -1,5 +1,9 @@
 # LLM Test
 
+## Result
+
+View the `result.json` file [here](https://github.com/okradze/llm-test/blob/main/result.json)
+
 ## Setup
 
 Requirements:
