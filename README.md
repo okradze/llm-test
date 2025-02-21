@@ -11,6 +11,8 @@ Requirements:
 -   Python >= 3.10
 -   [OpenRouter](https://openrouter.ai/) API KEY
 
+Create `.env` file from `.env.example` and add your OpenRouter API KEY.
+
 Create virtual env
 
 ```bash
