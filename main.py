@@ -4,6 +4,7 @@ import json
 import html
 import re
 import unicodedata
+import time
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -22,7 +23,6 @@ client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPEN_ROUTER_API_KEY,
 )
-
 
 # Define models by provider
 MODELS = {
@@ -47,38 +47,57 @@ MODELS = {
     ],
 }
 
-
 # Cache for OpenAI responses
 openai_cache = {}  # Structure: {tweet_id: {model: result}}
 
 
 async def score_by_model(messages, model: str, tweet_id: str):
+    start_time = time.time()
+
     if tweet_id and "gpt" in model:
         if tweet_id in openai_cache and model in openai_cache[tweet_id]:
             return openai_cache[tweet_id][model]
 
-    completion = await client.chat.completions.create(
-        extra_body={},
-        model=model,
-        messages=messages,
-        timeout=300,
-        temperature=0.0001,
-        top_p=0.0001,
-    )
+    max_retries = 3
 
-    content = completion.choices[0].message.content
-    extracted_score = None
+    for attempt in range(max_retries):
+        try:
+            completion = await client.chat.completions.create(
+                extra_body={},
+                model=model,
+                messages=messages,
+                timeout=300,
+                temperature=0.0001,
+                top_p=0.0001,
+            )
+            content = completion.choices[0].message.content
+            extracted_score = None
 
-    if isinstance(content, str):
-        extracted_score = int(LinkContentPrompt().extract_score(content))
+            if isinstance(content, str):
+                extracted_score = int(LinkContentPrompt().extract_score(content))
 
-    result = {"score": extracted_score, "result": content}
+            end_time = time.time()
 
-    if "gpt" in model:
-        openai_cache[tweet_id] = openai_cache.get(tweet_id, {})
-        openai_cache[tweet_id][model] = result
+            result = {
+                "score": extracted_score,
+                "result": content,
+                "time_taken": end_time - start_time,
+            }
 
-    return result
+            if "gpt" in model:
+                openai_cache[tweet_id] = openai_cache.get(tweet_id, {})
+                openai_cache[tweet_id][model] = result
+
+            return result
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+
+            if attempt == max_retries - 1:
+                return {
+                    "score": None,
+                    "result": None,
+                    "time_taken": time.time() - start_time,
+                }
 
 
 async def score_item(message, models, item):
@@ -173,6 +192,7 @@ async def process_items_group(batch_items, models):
         for model in provider
         if model != "gpt-4o-mini"
     }
+    timing_stats = {model: [] for provider in models.values() for model in provider}
 
     for model_results, item, messages in results:
         processed_item = {
@@ -194,6 +214,9 @@ async def process_items_group(batch_items, models):
             if score is not None:
                 scores[model][score] = scores[model].get(score, 0) + 1
 
+            # Add timing statistics
+            timing_stats[model].append(result["time_taken"])
+
             # Count matches with gpt-4o-mini
             if (
                 model != "gpt-4o-mini"
@@ -204,19 +227,36 @@ async def process_items_group(batch_items, models):
 
         items.append(processed_item)
 
-    return {"scores": scores, "matches": matches, "total": len(results), "items": items}
+    # Calculate timing statistics
+    timing_summary = {}
+    for model, times in timing_stats.items():
+        if times:
+            timing_summary[model] = {
+                "avg_time": sum(times) / len(times),
+                "min_time": min(times),
+                "max_time": max(times),
+                "total_time": sum(times),
+            }
+
+    return {
+        "scores": scores,
+        "matches": matches,
+        "total": len(results),
+        "items": items,
+        "timing": timing_summary,
+    }
 
 
 async def main():
     # Read data.json
     with open("data.json", "r") as f:
         try:
-            items = json.loads(f.read())[:100]  # Limited to 10 items for testing
+            items = json.loads(f.read())
         except json.JSONDecodeError:
             print("Error reading data.json")
             return
 
-    GROUP_SIZE = 4
+    GROUP_SIZE = 20
 
     all_items = []
     all_scores = {model: {} for provider in MODELS.values() for model in provider}
@@ -225,6 +265,17 @@ async def main():
         for provider in MODELS.values()
         for model in provider
         if model != "gpt-4o-mini"
+    }
+    all_timing = {
+        model: {
+            "avg_time": 0,
+            "min_time": float("inf"),
+            "max_time": 0,
+            "total_time": 0,
+            "times": [],
+        }
+        for provider in MODELS.values()
+        for model in provider
     }
 
     # Process all groups
@@ -243,7 +294,26 @@ async def main():
         for model, matches in group_results["matches"].items():
             all_matches[model] += matches
 
+        # Merge timing statistics
+        for model, stats in group_results["timing"].items():
+            current_stats = all_timing[model]
+            current_stats["total_time"] += stats["total_time"]
+            current_stats["min_time"] = min(
+                current_stats["min_time"], stats["min_time"]
+            )
+            current_stats["max_time"] = max(
+                current_stats["max_time"], stats["max_time"]
+            )
+            current_stats["times"].extend([stats["avg_time"]])
+
         print(f"Processed group {i + 1} - {i + GROUP_SIZE}")
+
+    # Calculate final average times
+    for model in all_timing:
+        times = all_timing[model]["times"]
+        if times:
+            all_timing[model]["avg_time"] = sum(times) / len(times)
+        del all_timing[model]["times"]  # Remove the temporary times list
 
     # Sort scores in ascending order for each model
     sorted_scores = {
@@ -260,6 +330,7 @@ async def main():
             "total": len(all_items),
             "matches": sorted_matches,
             "scores": sorted_scores,
+            "timing": all_timing,
         },
         "items": all_items,
     }
